@@ -58,13 +58,14 @@ class MainActivity : ComponentActivity() {
         if (uri == null) return@registerForActivityResult
         lifecycleScope.launch {
             runCatching {
-                withContext(Dispatchers.IO) {
+                val text = withContext(Dispatchers.IO) {
                     contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
                         ?: error("Could not read selected file")
                 }
-            }.onSuccess { text ->
                 Config.parse(ByteArrayInputStream(text.toByteArray(Charsets.UTF_8)))
                 SecureConfigStore.save(this@MainActivity, text)
+                text
+            }.onSuccess { text ->
                 configText = text
                 status = "Configuration saved securely on this device"
             }.onFailure { error ->
