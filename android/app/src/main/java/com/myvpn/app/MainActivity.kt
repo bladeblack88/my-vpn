@@ -1,6 +1,10 @@
 package com.myvpn.app
 
+import android.content.Context
 import android.content.Intent
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
 import android.net.VpnService
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -30,6 +34,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 private val Bg = Color(0xFF0B0F14)
 private val Panel = Color(0xFF151C24)
@@ -43,6 +52,7 @@ class MainActivity : ComponentActivity() {
     private var connected by mutableStateOf(false)
     private var status by mutableStateOf("Not connected")
     private var busy by mutableStateOf(false)
+    private var autoConnect by mutableStateOf(false)
 
     private val configPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@registerForActivityResult
@@ -53,8 +63,10 @@ class MainActivity : ComponentActivity() {
                         ?: error("Could not read selected file")
                 }
             }.onSuccess { text ->
+                Config.parse(ByteArrayInputStream(text.toByteArray(Charsets.UTF_8)))
+                SecureConfigStore.save(this@MainActivity, text)
                 configText = text
-                status = "Configuration loaded"
+                status = "Configuration saved securely on this device"
             }.onFailure { error ->
                 status = error.message ?: "Could not read configuration"
             }
@@ -68,15 +80,30 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        configText = runCatching { SecureConfigStore.load(this) }.getOrNull()
+        autoConnect = getPreferences(Context.MODE_PRIVATE).getBoolean("auto_connect", false)
         setContent {
             MyVpnScreen(
                 connected = connected,
                 busy = busy,
                 status = status,
                 hasConfig = configText != null,
+                autoConnect = autoConnect,
+                onAutoConnectChange = { enabled ->
+                    autoConnect = enabled
+                    getPreferences(Context.MODE_PRIVATE).edit().putBoolean("auto_connect", enabled).apply()
+                    status = if (enabled) "Auto-connect enabled for future app launches" else "Auto-connect disabled"
+                },
                 onImport = { configPicker.launch(arrayOf("text/*", "application/octet-stream")) },
                 onToggle = { toggleTunnel() }
             )
+        }
+        lifecycleScope.launch {
+            if (autoConnect && !configText.isNullOrBlank()) {
+                val permissionIntent = VpnService.prepare(this@MainActivity)
+                if (permissionIntent == null) startTunnel()
+                else status = "Approve Android VPN permission once to use auto-connect"
+            } else status = if (configText != null) "Saved profile ready" else "Import a WireGuard profile to begin"
         }
     }
 
@@ -143,6 +170,8 @@ private fun MyVpnScreen(
     busy: Boolean,
     status: String,
     hasConfig: Boolean,
+    autoConnect: Boolean,
+    onAutoConnectChange: (Boolean) -> Unit,
     onImport: () -> Unit,
     onToggle: () -> Unit
 ) {
@@ -201,6 +230,16 @@ private fun MyVpnScreen(
                 Spacer(Modifier.height(24.dp))
                 Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(18.dp)) {
                     Column(Modifier.fillMaxWidth().padding(18.dp)) {
+                        Text("CONNECTION SETTINGS", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Auto-connect", fontWeight = FontWeight.SemiBold)
+                                Text("Reconnect when you open My VPN", color = Muted, fontSize = 11.sp)
+                            }
+                            Switch(checked = autoConnect, onCheckedChange = onAutoConnectChange)
+                        }
+                        HorizontalDivider(color = Color(0xFF29333D))
+                        Spacer(Modifier.height(12.dp))
                         Text("VPN SERVER", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp)
                         Spacer(Modifier.height(10.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -208,7 +247,7 @@ private fun MyVpnScreen(
                             Text("WireGuard", color = Green, fontSize = 12.sp)
                         }
                         Spacer(Modifier.height(8.dp))
-                        Text(if (hasConfig) "Configuration imported" else "No configuration added", color = Muted, fontSize = 12.sp)
+                        Text(if (hasConfig) "Saved encrypted on this device" else "No configuration added", color = Muted, fontSize = 12.sp)
                         Spacer(Modifier.height(14.dp))
                         OutlinedButton(
                             onClick = onImport,
@@ -226,5 +265,42 @@ private fun MyVpnScreen(
                 Text("MY VPN  •  PRIVATE BY DESIGN", color = Color(0xFF53616E), fontSize = 10.sp, letterSpacing = 1.2.sp)
             }
         }
+    }
+}
+
+
+/** Encrypts the WireGuard profile with an AES key held by Android Keystore. */
+private object SecureConfigStore {
+    private const val PREFS = "myvpn_secure_profile"
+    private const val VALUE = "profile"
+    private const val ALIAS = "myvpn_profile_aes"
+
+    private fun key(): SecretKey {
+        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (store.getKey(ALIAS, null) as? SecretKey)?.let { return it }
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        generator.init(KeyGenParameterSpec.Builder(
+            ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256).build())
+        return generator.generateKey()
+    }
+
+    fun save(context: Context, text: String) {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        val bytes = cipher.iv + cipher.doFinal(text.toByteArray(Charsets.UTF_8))
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(VALUE, Base64.encodeToString(bytes, Base64.NO_WRAP)).apply()
+    }
+
+    fun load(context: Context): String? {
+        val encoded = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(VALUE, null) ?: return null
+        val bytes = Base64.decode(encoded, Base64.NO_WRAP)
+        require(bytes.size > 12) { "Saved profile is damaged" }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
+        return cipher.doFinal(bytes.copyOfRange(12, bytes.size)).toString(Charsets.UTF_8)
     }
 }
