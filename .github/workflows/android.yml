@@ -14,8 +14,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository and pinned native dependencies
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -23,24 +25,27 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Gradle 8.11.1
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.11.1"
-
-      - name: Set up Android SDK
+      - name: Set up Android SDK, NDK and CMake
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmake;3.22.1'
 
-      - name: Build debug APK
-        working-directory: android
-        run: gradle assembleDebug
+      - name: Brand upstream app as My VPN
+        working-directory: third_party/ByeDPIAndroid
+        run: |
+          sed -i 's/applicationId = "io.github.dovecoteescapee.byedpi"/applicationId = "com.myvpn.app"/' app/build.gradle.kts
+          sed -i 's/<string name="app_name">ByeDPI<\//<string name="app_name">My VPN<\//' app/src/main/res/values/strings.xml
+          sed -i 's/<string name="notification_title">ByeDPI<\//<string name="notification_title">My VPN<\//' app/src/main/res/values/strings.xml
+          chmod +x gradlew
+
+      - name: Build serverless Anti-DPI APK
+        working-directory: third_party/ByeDPIAndroid
+        run: ./gradlew --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: my-vpn-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: my-vpn-serverless-debug-apk
+          path: third_party/ByeDPIAndroid/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
